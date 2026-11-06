@@ -1,0 +1,47 @@
+[project]
+name = "task-manager"
+version = "0.1.0"
+description = "Self-hosted assistant that turns Telegram messages into Jira task drafts using a local LLM"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "alembic>=1.20.1",
+    "httpx>=0.28.1",
+    "natasha>=1.6.0",
+    "aiogram>=3.27",
+    "pydantic>=2.12,<2.13",
+    "pydantic-settings>=2.16.2",
+    "pymorphy3>=2.0.6",
+    "pyyaml>=6.0.3",
+    "sqlalchemy[asyncio]>=2.1.8",
+    "telethon>=1.45.0",
+    "sqlcipher3-wheels>=0.5.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/task_manager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# A worker thread outliving its event loop can hang the process on shutdown.
+filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# Cyrillic text in strings is expected in a Russian-language project.
+ignore = ["RUF001"]

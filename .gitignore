@@ -1,0 +1,48 @@
+# Секреты
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Данные: переписка и карта псевдонимов
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Настоящие списки чатов: в репозиторий идут только примеры
+# На случай, если их создадут для разработки: рабочие копии хранятся зашифрованными
+config/chats.yaml
+config/scope.yaml
+config/jira.yaml
+config/me.yaml
+
+# Выборка для оценки модели: обезличенный текст остаётся чувствительным
+eval/dataset/
+eval/results/
+
+# Зашифрованный архив оценки лежит рядом с планами, в репозиторий не идёт
+eval/archive.db
+
+# Локальные рабочие файлы
+temp/
+backups/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/

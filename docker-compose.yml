@@ -1,0 +1,184 @@
+name: task-manager
+
+# Start and stop through scripts/tm.ps1: it loads the secrets into memory first.
+
+x-logging: &logging
+  # Unlimited by default, and the logs would slowly fill the disk.
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+x-app: &app
+  build: .
+  image: task-manager:dev
+  env_file:
+    - path: .env
+      required: false
+  environment: &environment
+    DATABASE_PATH: /data/app.db
+    CONFIG_DIR: /app/config
+    HEARTBEAT_DIR: /tmp
+    SECRETS_DIR: /secrets
+    # Without the key a service stops rather than creating an unencrypted database.
+    REQUIRE_ENCRYPTED_DB: "1"
+    ATTACHMENTS_DIR: /attachments
+    # numpy otherwise starts a thread per CPU core, and they burn over 30 times the CPU on the small
+    # matrices Natasha uses while finishing later than one thread does.
+    OPENBLAS_NUM_THREADS: "1"
+  volumes:
+    # A named volume, because SQLite file locking is unreliable on Windows bind mounts.
+    - app_data:/data
+    - secrets_common:/secrets:ro
+    - ./config:/app/config:ro
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging: *logging
+
+x-service: &service
+  <<: *app
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  # Holds the in-memory volumes open and receives the secrets from tm start. It has no network and
+  # never reads them itself. Memory, so nothing is on disk, and they survive a service's restart.
+  keeper:
+    image: task-manager:dev
+    build: .
+    read_only: true
+    network_mode: none
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+    command: ["sleep", "infinity"]
+    volumes:
+      - secrets_common:/secrets/common
+      - secrets_collector:/secrets/collector
+      - secrets_bot:/secrets/bot
+      - secrets_jira:/secrets/jira
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  collector:
+    <<: *service
+    volumes:
+      - app_data:/data
+      # Telegram credentials and the session give full access to the account,
+      # so only this container gets them.
+      - secrets_collector:/secrets:ro
+      - attachments_tmp:/attachments
+      - ./config:/app/config:ro
+    command: ["python", "-m", "task_manager", "run", "collector"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "task_manager.health", "collector"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  anonymizer:
+    <<: *service
+    command: ["python", "-m", "task_manager", "run", "anonymizer"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "task_manager.health", "anonymizer"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  analyzer:
+    <<: *service
+    environment:
+      <<: *environment
+      # Ollama runs outside the containers, on this machine.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "task_manager", "run", "analyzer"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "task_manager.health", "analyzer"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  review_bot:
+    <<: *service
+    environment:
+      <<: *environment
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    volumes:
+      - app_data:/data
+      # The bot token is available to this container only.
+      - secrets_bot:/secrets:ro
+      - attachments_tmp:/attachments
+      - ./config:/app/config:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "task_manager", "run", "review_bot"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "task_manager.health", "review_bot"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  jira_export:
+    <<: *service
+    volumes:
+      - app_data:/data
+      # The Jira token is available to this container only.
+      - secrets_jira:/secrets:ro
+      - attachments_tmp:/attachments
+      - ./config:/app/config:ro
+    command: ["python", "-m", "task_manager", "run", "jira_export"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "task_manager.health", "jira_export"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Runs only through tm backup. The copies are encrypted, so a plain folder is fine.
+  backup:
+    <<: *app
+    profiles: [tools]
+    restart: "no"
+    volumes:
+      - app_data:/data
+      - secrets_common:/secrets:ro
+      - ${TM_BACKUP_DIR:-./backups}:/backups
+      - ./config:/app/config:ro
+    command: ["python", "-m", "task_manager", "backup", "/backups"]
+
+volumes:
+  app_data:
+  # In memory only. They vanish when Docker stops, and tm start fills them again.
+  secrets_common: &secrets
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "uid=1000,gid=1000,mode=0700,size=2m"
+  secrets_collector: *secrets
+  secrets_bot: *secrets
+  secrets_jira: *secrets
+  # Unanonymized files in transit, in memory too. A file too large for this is reported as failed.
+  attachments_tmp:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "uid=1000,gid=1000,mode=0700,size=1g"

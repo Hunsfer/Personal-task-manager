@@ -1,0 +1,23 @@
+# Replies that are never a task on their own. A message goes to the model unless it is exactly one
+# of these (ignoring case, punctuation and emoji) and has no files. Missing a task is worse than
+# asking the model about small talk, so keep this list short. "Да" and "нет" are left out on purpose:
+# they can confirm a request.
+noise_phrases:
+  - ок
+  - окей
+  - ok
+  - ага
+  - угу
+  - спасибо
+  - спс
+  - благодарю
+  - понял
+  - поняла
+  - принято
+  - хорошо
+  - отлично
+  - супер
+  - привет
+  - всем привет
+  - доброе утро
+  - добрый день
