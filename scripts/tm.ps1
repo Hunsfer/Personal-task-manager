@@ -10,7 +10,7 @@
     tm telegram-login
     tm backup | verify <файл> | restore <файл>
     tm eval seal|open
-    tm watchdog
+    tm watchdog                 # раз в 5 минут из планировщика, сам поднимает упавшую систему
 
     Секреты хранятся зашифрованными DPAPI: расшифровать их можно только под этой учётной записью
     Windows. Контейнеры получают их через тома в памяти, поэтому на диске в открытом виде их нет.
@@ -33,6 +33,10 @@ $Home_ = if ($env:TM_HOME) { $env:TM_HOME } else { Join-Path $env:LOCALAPPDATA "
 $Store = Join-Path $Home_ "secrets"
 $StoppedMark = Join-Path $Home_ "stopped"
 $WatchState = Join-Path $Home_ "watchdog.json"
+$RecoveryState = Join-Path $Home_ "recovery.json"
+# Attempts in a row. The watchdog runs every 5 minutes, which is also the pause between them.
+$MaxRecoveries = 3
+$StartLock = "Local\TaskManagerStart"
 $Map = Get-Content (Join-Path $PSScriptRoot "secret-map.json") -Raw | ConvertFrom-Json
 $BackupDir = if ($env:TM_BACKUP_DIR) { $env:TM_BACKUP_DIR } else { Join-Path $Root "backups" }
 $Docker = Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\resources\bin\docker.exe"
@@ -134,16 +138,94 @@ function Push-Secrets {
     }
 }
 
+function Enter-StartLock {
+    # One start at a time: sign-in, the watchdog and a manual tm start can coincide.
+    $lock = [System.Threading.Mutex]::new($false, $StartLock)
+    try {
+        if ($lock.WaitOne(0)) { return $lock }
+    } catch [System.Threading.AbandonedMutexException] {
+        # A start that died left it behind. Taking it over is safe.
+        return $lock
+    }
+    $lock.Dispose()
+    return $null
+}
+
+function Test-StartRunning {
+    $lock = Enter-StartLock
+    if ($null -eq $lock) { return $true }
+    $lock.ReleaseMutex()
+    $lock.Dispose()
+    return $false
+}
+
 function Invoke-Start {
+    # Held until this process ends, even when Fail exits early.
+    $script:Lock = Enter-StartLock
+    if ($null -eq $script:Lock) { Fail "система уже запускается" }
     Remove-Item $StoppedMark -Force -ErrorAction SilentlyContinue
     Wait-Docker
     Start-Ollama
     Compose up -d --build keeper | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "не удалось запустить keeper" }
     Push-Secrets
-    Compose up -d --wait @Services | Out-Null
+    # Services that crashed without secrets wait out Docker's growing restart delay, which can
+    # take minutes, and their old health status would fail the wait below at once.
+    $stuck = @(Compose ps -a --format "{{.Service}} {{.State}}" @Services |
+        Where-Object { $_ -notmatch " running$" } | ForEach-Object { ($_ -split " ")[0] })
+    if ($stuck) { Compose restart @stuck | Out-Null }
+    Compose up -d --wait --wait-timeout 300 @Services | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "не все сервисы запустились: tm status, tm logs <сервис>" }
     Write-Host "Система запущена."
+}
+
+function Test-SystemHealthy {
+    & $Docker info --format "{{.ServerVersion}}" *> $null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $lines = @(Compose ps -a --format "{{.Service}}|{{.Status}}" @Services)
+    foreach ($service in $Services) {
+        $line = $lines | Where-Object { $_ -like "$service|*" }
+        # A service still starting is fine: it gets until the next run to become healthy.
+        if ("$line" -notmatch "\((healthy|health: starting)\)") { return $false }
+    }
+    return $true
+}
+
+function Read-JsonState([string]$Path) {
+    $state = @{}
+    if (Test-Path $Path) {
+        (Get-Content $Path -Raw | ConvertFrom-Json).PSObject.Properties |
+            ForEach-Object { $state[$_.Name] = $_.Value }
+    }
+    return $state
+}
+
+function Invoke-Recovery {
+    <# Brings the system back after Docker restarted, for example when Windows updated WSL: the
+       secrets in memory are gone then, and the services can't start without them. Gives up
+       after $MaxRecoveries failed attempts in a row, so a broken system isn't restarted forever.
+       Returns what to tell the owner, or nothing. #>
+    $state = Read-JsonState $RecoveryState
+    $attempts = [int]$state["attempts"]
+    if (Test-SystemHealthy) {
+        # Also after a manual tm start: the counter starts over.
+        Remove-Item $RecoveryState -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    if ($state["gave_up"] -or (Test-StartRunning)) { return $null }
+    $attempts += 1
+    @{ attempts = $attempts } | ConvertTo-Json | Set-Content $RecoveryState -Encoding utf8
+    # A separate process, because a failing start ends its process.
+    & (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath start *> $null
+    if ($LASTEXITCODE -eq 0 -and (Test-SystemHealthy)) {
+        Remove-Item $RecoveryState -Force -ErrorAction SilentlyContinue
+        return "🔄 Система упала и перезапущена автоматически (попытка $attempts из $MaxRecoveries)."
+    }
+    if ($attempts -lt $MaxRecoveries) { return $null }
+    @{ attempts = $attempts; gave_up = $true } | ConvertTo-Json |
+        Set-Content $RecoveryState -Encoding utf8
+    return "⛔ Автоматический перезапуск не помог: $MaxRecoveries попытки подряд. Больше " +
+        "пытаться не буду. Запустите вручную: tm start, причину покажут tm status и tm logs."
 }
 
 function Invoke-Stop {
@@ -318,15 +400,14 @@ function Get-Problems {
 }
 
 function Invoke-Watchdog {
-    # A deliberate stop raises no alarm.
+    # A deliberate stop raises no alarm and brings nothing back.
     if (Test-Path $StoppedMark) { return }
-    $known = @{}
-    if (Test-Path $WatchState) {
-        (Get-Content $WatchState -Raw | ConvertFrom-Json).PSObject.Properties |
-            ForEach-Object { $known[$_.Name] = $_.Value }
-    }
+    $known = Read-JsonState $WatchState
+    # First, so that a successful restart raises no alarm about what it fixed.
+    $recovery = Invoke-Recovery
     $problems = Get-Problems
     try {
+        if ($recovery) { Send-ToOwner $recovery }
         foreach ($name in $problems.Keys) {
             if (-not $known.ContainsKey($name)) {
                 Send-ToOwner "⚠️ $($problems[$name])"

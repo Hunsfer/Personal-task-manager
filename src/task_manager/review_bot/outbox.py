@@ -75,6 +75,8 @@ class Outbox:
         self._start_reported = not announce_start
         self._watched = watched
         self._alerts: set[str] = set()
+        # States and queue times written before this start describe the downtime, not now.
+        self._started_at = datetime.now(UTC)
 
     @property
     def ollama_available(self) -> bool:
@@ -233,7 +235,10 @@ class Outbox:
                 select(func.min(Message.sent_at)).where(Message.status == MessageStatus.PENDING)
             )
         problems: dict[str, str] = {}
-        for service in self._watched:
+        # Services start together with the bot and need a moment to report in. A service that is
+        # really broken is still silent once this has passed.
+        settled = now - self._started_at >= SERVICE_SILENT
+        for service in self._watched if settled else ():
             row = rows.get(service)
             if row is None:
                 continue
@@ -243,8 +248,9 @@ class Outbox:
             elif row.detail == "telegram_disconnected":
                 problems[service] = "⚠️ Нет связи с Telegram, новые сообщения не читаются."
         if oldest is not None and self.ollama_available:
-            started = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
-            if now - started > QUEUE_STUCK:
+            waiting = oldest if oldest.tzinfo else oldest.replace(tzinfo=UTC)
+            # Messages from the downtime have waited long, but the queue has only just started.
+            if now - max(waiting, self._started_at) > QUEUE_STUCK:
                 problems["queue"] = "⚠️ Очередь анализа стоит: сообщения ждут больше часа."
         for name, text in problems.items():
             if name not in self._alerts:

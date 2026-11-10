@@ -338,6 +338,33 @@ def test_rotation_removes_what_older_backups_left_beside_them(tmp_path):
     assert not list(tmp_path.glob("*-wal")) + list(tmp_path.glob("*-shm"))
 
 
+def test_watchdog_brings_the_system_back_but_gives_up_after_three_tries():
+    script = (ROOT / "scripts" / "tm.ps1").read_text("utf-8")
+    assert "$MaxRecoveries = 3" in script
+    watchdog = script[script.index("function Invoke-Watchdog") :]
+    # Recovery comes first, and a deliberate stop still holds.
+    assert (
+        watchdog.index("StoppedMark")
+        < watchdog.index("Invoke-Recovery")
+        < watchdog.index("Get-Problems")
+    )
+    recovery = script[
+        script.index("function Invoke-Recovery") : script.index("function Get-Problems")
+    ]
+    assert "gave_up" in recovery
+    assert "Test-StartRunning" in recovery
+    assert "Больше" in recovery and "tm start" in recovery
+
+
+def test_start_takes_a_lock_and_restarts_services_stuck_in_docker_backoff():
+    script = (ROOT / "scripts" / "tm.ps1").read_text("utf-8")
+    start = script[
+        script.index("function Invoke-Start") : script.index("function Test-SystemHealthy")
+    ]
+    assert "Enter-StartLock" in start
+    assert start.index("Push-Secrets") < start.index("Compose restart") < start.index("--wait")
+
+
 def test_no_machine_paths_in_the_repository():
     for name in ("scripts/tm.ps1", "docker-compose.yml"):
         text = (ROOT / name).read_text("utf-8")
@@ -437,8 +464,14 @@ async def _ping_ok() -> None:
     return None
 
 
-def _outbox(engine, messenger, watched=("collector", "analyzer")) -> Outbox:
-    return Outbox(make_sessions(engine), messenger, _ping_ok, 0, 60.0, watched, announce_start=True)
+def _outbox(engine, messenger, watched=("collector", "analyzer"), running_for=None) -> Outbox:
+    """`running_for` makes the bot look as if it started that long ago."""
+    outbox = Outbox(
+        make_sessions(engine), messenger, _ping_ok, 0, 60.0, watched, announce_start=True
+    )
+    if running_for is not None:
+        outbox._started_at -= running_for
+    return outbox
 
 
 def _run(engine, scenario):
@@ -487,7 +520,7 @@ def test_silent_service_is_reported_once_and_recovery_too(engine):
     async def scenario():
         messenger = FakeMessenger()
         await _state(engine, "collector", age_minutes=10)
-        outbox = _outbox(engine, messenger)
+        outbox = _outbox(engine, messenger, running_for=timedelta(minutes=10))
         await outbox.flush()
         await outbox.flush()
         alerts = [item[1] for item in messenger.sent if "не отвечает" in item[1]]
@@ -506,7 +539,7 @@ def test_lost_telegram_connection_is_reported(engine):
     async def scenario():
         messenger = FakeMessenger()
         await _state(engine, "collector", detail="telegram_disconnected")
-        await _outbox(engine, messenger).flush()
+        await _outbox(engine, messenger, running_for=timedelta(minutes=10)).flush()
         return [item[1] for item in messenger.sent]
 
     assert any("Нет связи с Telegram" in text_sent for text_sent in _run(engine, scenario))
@@ -527,7 +560,7 @@ def test_stuck_queue_is_reported_only_while_the_model_is_up(engine, monkeypatch)
                 )
             )
             await session.commit()
-        outbox = _outbox(engine, messenger, ())
+        outbox = _outbox(engine, messenger, (), running_for=timedelta(hours=3))
         outbox._down_since = 1.0
         await outbox.flush()
         while_down = [item[1] for item in messenger.sent if "Очередь" in item[1]]
@@ -538,6 +571,35 @@ def test_stuck_queue_is_reported_only_while_the_model_is_up(engine, monkeypatch)
     while_down, while_up = _run(engine, scenario)
     assert while_down == []
     assert len(while_up) == 1
+
+
+def test_just_started_bot_ignores_what_the_downtime_left_behind(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        await _state(engine, "collector", age_minutes=70, detail="telegram_disconnected")
+        await _state(engine, "analyzer", age_minutes=70)
+        async with AsyncSession(engine) as session:
+            session.add(Chat(chat_id=1))
+            await session.flush()
+            session.add(
+                Message(
+                    chat_id=1, msg_id=1, sent_at=datetime.now(UTC) - timedelta(hours=2), text="x"
+                )
+            )
+            await session.commit()
+        outbox = _outbox(engine, messenger)
+        await outbox.flush()
+        at_start = [item[1] for item in messenger.sent if "⚠️" in item[1]]
+        # A service still silent once the bot has settled is a real problem.
+        outbox._started_at -= timedelta(minutes=4)
+        await outbox.flush()
+        return at_start, [item[1] for item in messenger.sent if "⚠️" in item[1]]
+
+    at_start, settled = _run(engine, scenario)
+    assert at_start == []
+    assert any("collector не отвечает" in text_sent for text_sent in settled)
+    # The queue only started with the bot, so it isn't stuck yet.
+    assert not any("Очередь" in text_sent for text_sent in settled)
 
 
 def test_healthy_services_raise_nothing(engine):
