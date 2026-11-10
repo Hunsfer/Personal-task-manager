@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from task_manager.analyzer.classifier import AnswerError
 from task_manager.analyzer.drafts import REJECTED_ACTION, UNDECIDED, draft_lines
 from task_manager.analyzer.ollama import OllamaUnavailableError
+from task_manager.analyzer.thread import build_thread
 from task_manager.analyzer.verdict import DraftText, has_placeholder
 from task_manager.review_bot import views
 from task_manager.review_bot.chat_log import ChatLog
@@ -30,6 +31,7 @@ from task_manager.review_bot.render import (
     DraftCard,
     escape,
     format_size,
+    format_time,
     split_message,
 )
 from task_manager.storage.attachments import HIDDEN_KINDS, OPT_IN_KINDS
@@ -39,6 +41,9 @@ from task_manager.storage.models import (
     AttachmentUpload,
     Draft,
     DraftDecision,
+    DraftKind,
+    DraftMessage,
+    DraftRole,
     DraftStatus,
     ExportAction,
     FileRequest,
@@ -49,6 +54,9 @@ from task_manager.storage.models import (
 )
 
 APPROVED_ACTION = "approved"
+OWNER_CREATED_ACTION = "created_by_owner"
+RECENT_PAGE = 8
+RECENT_PREVIEW = 300
 EDITED_ACTION = "edited"
 MODEL_EDITED_ACTION = "model_edited"
 OTHER_REASON = "other"
@@ -60,9 +68,13 @@ logger = logging.getLogger(__name__)
 
 
 class TextEditor(Protocol):
+    model: str
+
     async def edit_text(
         self, lines, title: str, description: str, instruction: str
     ) -> DraftText: ...
+
+    async def rewrite(self, lines) -> DraftText | None: ...
 
 
 class TextAnonymizer(Protocol):
@@ -126,6 +138,8 @@ class Controller:
         self._name_choice: _NameChoice | None = None
         # Menus and questions, removed once answered so the chat holds only tasks.
         self._prompts: list[int] = []
+        # Messages whose draft the model is writing now, so a second press makes no duplicate.
+        self._making: set[int] = set()
 
     # Entry points
 
@@ -144,6 +158,8 @@ class Controller:
             match command.split("@")[0]:
                 case "/list":
                     await self._list()
+                case "/recent":
+                    await self._recent()
                 case "/status":
                     await self._status()
                 case "/overrides":
@@ -158,6 +174,7 @@ class Controller:
                     await self._say(
                         "Новые черновики приходят сами.\n"
                         "/list нерешённые черновики\n"
+                        "/recent что модель не сочла задачей, можно сделать черновик\n"
                         "/status очередь и модель\n"
                         "/overrides слова, отмеченные как не имена\n"
                         "/clear очистить переписку, статусы задач не меняются\n"
@@ -211,6 +228,8 @@ class Controller:
             "att": self._attachments,
             "atg": self._attachment_toggled,
             "open": self._open,
+            "rc": self._recent,
+            "mk": self._make_task,
             "retry": self._retry,
             "cancel": self._cancel,
         }
@@ -691,14 +710,120 @@ class Controller:
         async with self._sessions() as session:
             counters = await views.queue_counters(session)
         model = "доступна" if self._ollama_available() else "недоступна"
+        drafted, rejected = counters.get("day_draft", 0), counters.get("day_no_draft", 0)
+        noise, broken = counters.get("day_skipped", 0), counters.get("day_failed", 0)
         await self._say(
             f"Модель: {model}\n"
             f"В очереди на анализ: {counters['pending']}\n"
             f"Не разобрано: {counters['failed']}\n"
+            f"Проанализировано за сутки: {drafted + rejected + noise + broken}\n"
+            f"• в черновик: {drafted}\n"
+            f"• отклонено моделью: {rejected}, посмотреть: /recent\n"
+            f"• отсеяно как шум: {noise}\n"
+            f"• с ошибкой: {broken}\n"
             f"Черновики: ждут решения {counters.get('drafts_sent', 0)}, "
             f"приняты {counters.get('drafts_approved', 0)}, "
             f"отклонены {counters.get('drafts_rejected', 0)}"
         )
+
+    async def _recent(self, offset: str = "0") -> None:
+        start = max(int(offset), 0)
+        async with self._sessions() as session:
+            items, more = await views.rejected_messages(session, RECENT_PAGE, start)
+        if not items:
+            await self._say("Больше таких сообщений нет." if start else "Таких сообщений нет.")
+            return
+        parts, keyboard = [], []
+        for number, item in enumerate(items, start + 1):
+            text = item.text or "(без текста)"
+            preview = text if len(text) <= RECENT_PREVIEW else f"{text[:RECENT_PREVIEW]}…"
+            parts.append(
+                f"<b>{number}.</b> {format_time(item.sent_at, self._offset)} · "
+                f"{escape(item.chat_title or 'чат')} · {escape(item.sender)}\n{escape(preview)}"
+            )
+            keyboard.append([Button(f"➕ Сделать задачей: {number}", f"mk:{item.message_id}")])
+        if more:
+            keyboard.append([Button("Ещё", f"rc:{start + RECENT_PAGE}")])
+        await self._say(
+            "Модель решила, что это не задачи. Новые сверху:\n\n" + "\n\n".join(parts), keyboard
+        )
+
+    async def _make_task(self, message_id: str) -> None:
+        """A draft from a message the model turned down. Its text still comes from the model.
+
+        Jira gets only the model's rephrasing, never the chat's own words, so without the model
+        nothing is created.
+        """
+        key = int(message_id)
+        if key in self._making:
+            await self._say("Черновик по этому сообщению уже готовится.")
+            return
+        self._making.add(key)
+        try:
+            await self._make_task_once(key)
+        finally:
+            self._making.discard(key)
+
+    async def _make_task_once(self, message_id: int) -> None:
+        async with self._sessions() as session:
+            if await self._already_drafted(session, message_id):
+                return
+            message = await session.get(Message, message_id)
+            if message is None:
+                await self._say("Сообщение не найдено.")
+                return
+            thread = await build_thread(session, message, await self._rules(session))
+        if thread is None:
+            await self._say("Сообщение ещё обезличивается. Попробуйте через минуту.")
+            return
+        await self._ask("Модель пишет черновик…")
+        try:
+            # The reply chain explains what the message answers, so the text doesn't lose it.
+            text = await self._editor.rewrite([*thread.reply_chain, thread.target])
+        except OllamaUnavailableError:
+            await self._say("Модель недоступна: возможно, ПК выключен. Черновик не создан.")
+            return
+        if text is None:
+            await self._say("Модель не дала понятного ответа. Черновик не создан, попробуйте ещё.")
+            return
+        now = datetime.now(UTC)
+        async with self._sessions() as session:
+            if await self._already_drafted(session, message_id):
+                return
+            message = await session.get_one(Message, message_id)
+            draft = Draft(
+                chat_id=message.chat_id,
+                title=text.title,
+                description=text.description,
+                priority="medium",
+                has_placeholders=has_placeholder(text.title) or has_placeholder(text.description),
+                kind=DraftKind.TASK,
+                model=self._editor.model,
+                prompt_id=views.OWNER_PROMPT_ID,
+                last_message_at=message.sent_at,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(draft)
+            await session.flush()
+            session.add(
+                DraftMessage(draft_id=draft.id, message_id=message_id, role=DraftRole.TRIGGER)
+            )
+            session.add(
+                DraftDecision(draft_id=draft.id, decision=OWNER_CREATED_ACTION, decided_at=now)
+            )
+            await session.commit()
+        await self._reset()
+        await self._flush()
+
+    async def _already_drafted(self, session: AsyncSession, message_id: int) -> bool:
+        draft_id = await views.draft_of(session, message_id)
+        if draft_id is None:
+            return False
+        await self._say(
+            f"Это сообщение уже в задаче №{draft_id}.", [[Button("Открыть", f"open:{draft_id}")]]
+        )
+        return True
 
     async def _retry(self) -> None:
         async with self._sessions() as session:

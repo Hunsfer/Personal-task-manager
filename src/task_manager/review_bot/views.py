@@ -1,6 +1,7 @@
 """Reads drafts for the bot. Real values appear only here, for showing to the owner."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,17 @@ _ROLE_NAMES = {
 MARKABLE_KINDS = ("PERSON", "ORG", "LOC")
 # Known by Telegram ID, so this is a real person whatever the name looks like.
 KNOWN_PERSON_KEY = "user:"
+# Stored as the prompt of a draft the owner made from a message the model turned down.
+OWNER_PROMPT_ID = "owner"
+
+
+@dataclass(frozen=True)
+class RejectedMessage:
+    message_id: int
+    sent_at: datetime
+    chat_title: str | None
+    sender: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -124,7 +136,13 @@ async def load_card(session: AsyncSession, draft_id: int) -> DraftCard | None:
         description=draft.description,
         deadline=draft.deadline,
         priority=draft.priority,
-        reason=analysis.assignment_reason if analysis is not None else None,
+        reason=(
+            "owner"
+            if draft.prompt_id == OWNER_PROMPT_ID
+            else analysis.assignment_reason
+            if analysis is not None
+            else None
+        ),
         chat_title=chat.title if chat is not None else None,
         last_message_at=draft.last_message_at,
         message_count=len(messages),
@@ -150,16 +168,23 @@ async def load_card(session: AsyncSession, draft_id: int) -> DraftCard | None:
     )
 
 
+async def _sender(session: AsyncSession, message: Message) -> str:
+    """The real name, for showing to the owner only."""
+    if message.is_outgoing:
+        return "Вы"
+    if message.sender_id is not None:
+        person = await session.get(Person, message.sender_id)
+        if person is not None:
+            names = (person.first_name, person.last_name)
+            return " ".join(n for n in names if n) or person.username or "неизвестно"
+    return "неизвестно"
+
+
 async def source_parts(session: AsyncSession, draft_id: int, utc_offset_hours: int) -> list[str]:
     """A draft's messages with real names, for the owner only. One HTML part per message."""
     parts = []
     for message, role in await _draft_messages(session, draft_id):
-        sender = "Вы" if message.is_outgoing else "неизвестно"
-        if not message.is_outgoing and message.sender_id is not None:
-            person = await session.get(Person, message.sender_id)
-            if person is not None:
-                names = (person.first_name, person.last_name)
-                sender = " ".join(n for n in names if n) or person.username or sender
+        sender = await _sender(session, message)
         head = (
             f"<b>{_ROLE_NAMES[role]}</b> · {escape(sender)} · "
             f"{format_time(message.sent_at, utc_offset_hours)}"
@@ -198,6 +223,46 @@ async def markable(session: AsyncSession, draft_id: int) -> list[Markable]:
     return found
 
 
+async def draft_of(session: AsyncSession, message_id: int) -> int | None:
+    """The draft a message already belongs to, in any role."""
+    return await session.scalar(
+        select(DraftMessage.draft_id).where(DraftMessage.message_id == message_id).limit(1)
+    )
+
+
+async def rejected_messages(
+    session: AsyncSession, limit: int, offset: int
+) -> tuple[list[RejectedMessage], bool]:
+    """Messages the model judged not to be a task, newest first, and whether more follow.
+
+    A message already in a draft, even as context, is left out: it has reached the owner.
+    """
+    in_draft = select(DraftMessage.message_id).where(DraftMessage.message_id == Message.id)
+    rows = list(
+        await session.scalars(
+            select(Message)
+            .join(Analysis, Analysis.message_id == Message.id)
+            .where(Analysis.outcome == AnalysisOutcome.NO_DRAFT, ~in_draft.exists())
+            .order_by(Message.sent_at.desc(), Message.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+    )
+    items = []
+    for message in rows[:limit]:
+        chat = await session.get(Chat, message.chat_id)
+        items.append(
+            RejectedMessage(
+                message_id=message.id,
+                sent_at=message.sent_at,
+                chat_title=chat.title if chat is not None else None,
+                sender=await _sender(session, message),
+                text=message.text,
+            )
+        )
+    return items, len(rows) > limit
+
+
 async def queue_counters(session: AsyncSession) -> dict[str, int]:
     pending = await session.scalar(
         select(func.count()).select_from(Message).where(Message.status == MessageStatus.PENDING)
@@ -209,9 +274,16 @@ async def queue_counters(session: AsyncSession) -> dict[str, int]:
     analyses = await session.scalar(
         select(func.count()).select_from(Analysis).where(Analysis.outcome == AnalysisOutcome.DRAFT)
     )
+    # A message edited and analyzed again counts once, by its latest analysis.
+    day = await session.execute(
+        select(Analysis.outcome, func.count())
+        .where(Analysis.analyzed_at >= datetime.now(UTC) - timedelta(days=1))
+        .group_by(Analysis.outcome)
+    )
     return {
         "pending": pending or 0,
         "failed": failed or 0,
         "task_decisions": analyses or 0,
         **{f"drafts_{status.value}": count for status, count in drafts.all()},
+        **{f"day_{outcome.value}": count for outcome, count in day.all()},
     }

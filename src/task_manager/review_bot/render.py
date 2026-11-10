@@ -34,6 +34,7 @@ REASON_NAMES = {
     "role": "фронтенд",
     "section": "ваш раздел",
     "promise": "ваше обещание",
+    "owner": "вы отметили сами",
 }
 _MARK = re.compile(r"<(?:(?:PERSON|ORG|LOC|PHONE|EMAIL|URL|IP|ID)_\d+|SECRET|CARD)>")
 _IRREVERSIBLE = ("<SECRET>", "<CARD>")

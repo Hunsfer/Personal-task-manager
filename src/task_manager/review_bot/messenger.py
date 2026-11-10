@@ -16,6 +16,7 @@ Keyboard = list[list[Button]]
 # Shown in the bot's menu button, so they needn't be typed.
 COMMANDS = (
     ("list", "Нерешённые задачи"),
+    ("recent", "Что модель не сочла задачей"),
     ("status", "Очередь и модель"),
     ("overrides", "Слова, отмеченные как не имена"),
     ("clear", "Очистить переписку, статусы не меняются"),

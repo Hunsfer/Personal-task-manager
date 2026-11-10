@@ -124,9 +124,19 @@ class FakeMessenger:
 
 
 class FakeEditor:
-    def __init__(self, answer=None) -> None:
+    model = "fake"
+
+    def __init__(self, answer=None, rewritten=None) -> None:
         self.answer = answer or DraftText(title="Новый", description="Новое описание")
+        self.rewritten = rewritten or DraftText(title="Сделано вручную", description="Текст модели")
         self.calls: list[dict] = []
+        self.rewrite_calls: list[list] = []
+
+    async def rewrite(self, lines):
+        self.rewrite_calls.append(list(lines))
+        if isinstance(self.rewritten, Exception):
+            raise self.rewritten
+        return self.rewritten
 
     async def edit_text(self, lines, title, description, instruction):
         self.calls.append(
@@ -996,6 +1006,117 @@ def test_list_and_status_commands(engine):
     assert "Нерешённых черновиков: 1" in text
     assert f"open:{draft_id}" in buttons
     assert "ждут решения 1" in status
+
+
+async def _rejected(engine, *msg_ids, drafted=()):
+    """Messages the model turned down, and optionally some it made drafts of."""
+    await _seed(engine, *({"msg_id": number} for number in sorted((*drafted, *msg_ids))))
+    answers = {number: _decision(False) for number in msg_ids}
+    answers |= {number: _decision() for number in drafted}
+    await _drain(engine, FakeClassifier(answers))
+
+
+async def _message_id(engine, msg_id) -> int:
+    async with AsyncSession(engine) as session:
+        return await session.scalar(select(Message.id).where(Message.msg_id == msg_id))
+
+
+def test_recent_lists_turned_down_messages_newest_first(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        await _rejected(engine, 2, 3, drafted=(1,))
+        controller, _ = _bot(engine, messenger)
+        await controller.on_text(OWNER, "/recent")
+        ids = [await _message_id(engine, number) for number in (2, 3)]
+        return messenger.last, messenger.buttons(), ids
+
+    text, buttons, (older, newer) = _run(engine, scenario)
+    # The drafted message has reached the owner already, so it isn't offered again.
+    assert buttons == [f"mk:{newer}", f"mk:{older}"]
+    assert "поправь шапку" in text
+
+
+def test_recent_comes_in_pages(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        await _rejected(engine, *range(1, 11))
+        controller, _ = _bot(engine, messenger)
+        await controller.on_text(OWNER, "/recent")
+        first = messenger.buttons()
+        await controller.on_callback(OWNER, "rc:8")
+        return first, messenger.buttons()
+
+    first, second = _run(engine, scenario)
+    assert len(first) == 9 and first[-1] == "rc:8"
+    assert len(second) == 2 and all(data.startswith("mk:") for data in second)
+
+
+def test_make_task_turns_a_turned_down_message_into_a_draft(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        editor = FakeEditor()
+        await _seed(
+            engine,
+            {"msg_id": 1, "text": "а где макет?", "is_outgoing": True},
+            {"msg_id": 2, "reply_to_msg_id": 1},
+        )
+        await _drain(engine, FakeClassifier({1: _decision(False), 2: _decision(False)}))
+        controller, _ = _bot(engine, messenger, editor)
+        message_id = await _message_id(engine, 2)
+        await controller.on_callback(OWNER, f"mk:{message_id}")
+        card = messenger.last
+        await controller.on_callback(OWNER, f"mk:{message_id}")
+        return (
+            editor,
+            card,
+            messenger.last,
+            await _rows(engine, Draft),
+            await _rows(engine, DraftMessage),
+            await _rows(engine, DraftDecision),
+            message_id,
+        )
+
+    editor, card, again, drafts, links, decisions, message_id = _run(engine, scenario)
+    # The reply chain goes along, so the text knows what the message answers.
+    assert [line.msg_id for line in editor.rewrite_calls[0]] == [1, 2]
+    assert len(editor.rewrite_calls) == 1
+    assert len(drafts) == 1
+    assert drafts[0].title == "Сделано вручную"
+    assert drafts[0].status is DraftStatus.SENT
+    assert [(link.message_id, link.role) for link in links] == [(message_id, DraftRole.TRIGGER)]
+    assert [decision.decision for decision in decisions] == ["created_by_owner"]
+    assert "Сделано вручную" in card
+    assert "вы отметили сами" in card
+    assert f"уже в задаче №{drafts[0].id}" in again
+
+
+def test_make_task_creates_nothing_without_the_model(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        await _rejected(engine, 1)
+        controller, _ = _bot(engine, messenger, FakeEditor(rewritten=OllamaUnavailableError()))
+        await controller.on_callback(OWNER, f"mk:{await _message_id(engine, 1)}")
+        return messenger.last, await _rows(engine, Draft)
+
+    text, drafts = _run(engine, scenario)
+    # Jira may get only the model's rephrasing, so a quote can't stand in for it.
+    assert "Модель недоступна" in text
+    assert drafts == []
+
+
+def test_status_shows_the_last_day_of_analysis(engine):
+    async def scenario():
+        messenger = FakeMessenger()
+        await _rejected(engine, 2, 3, drafted=(1,))
+        controller, _ = _bot(engine, messenger)
+        await controller.on_text(OWNER, "/status")
+        return messenger.last
+
+    status = _run(engine, scenario)
+    assert "Проанализировано за сутки: 3" in status
+    assert "в черновик: 1" in status
+    assert "отклонено моделью: 2" in status
+    assert "/recent" in status
 
 
 def test_retry_button_returns_failed_messages(engine):
